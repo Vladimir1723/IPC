@@ -593,3 +593,178 @@ dup2(N,N) = N;
 
 
 
+	exec			system
+pipe + dup2
+
+	FILE* popen(const char* command,
+				const char* type);
+				// "r" напр-р
+
+	int pclose(FILE* stream);
+
+
+именованный канал:
+	файл на фс, явл. входной дверью к каналу
+
+все каналы устроены одинаково, так что все  сказанное для неименованных,
+верно и для именованных
+
+fifo
+
+int mkfifo(const char* path,
+			mode_t rights); // н-р 0660
+
+каналы однонаправлены
+---> ====== ---->
+в обе  стороны - два канала
+	либо
+сокет
+---->			--->
+	 (=========)
+---->			<----
+
+однако unix-сокет требует от нас создания файла на диске, а мы не хотим(
+
+если не хотим, то можем сделать unix-сокет, не привязанный ни к какому файлу:
+
+int socketpair (int d, /* domain PF_UNIX и только!*/
+				int type,
+				int protocol,
+				int sv[2]);
+// пара сокетов, связанных друг с другом
+
+
+
+
+Процессор
+8 ножек 2 ручки для переноски
+4 ядра
+на нем запущено приложение, которое считает что-то, приходящее по сети,
+и ответ отдает обратно в сеть
+=> приложение слушает master-сокет, получает slave_socket и начинает его
+исполнять
+у нас 4 ядра, работаем в рамках 1 процесса и только с основным потоком
+тогда загрузится только одно ядро. плохо
+запустить 4 приложения?)
+можно приложение расфоркать, получится, что один и тот же сокет слушаает
+несколько приложений, и планировщик линукс сам распределит нагрузку
+грязный метод, но работает
+как сделать чисто? как контролировать распределение нагрузки на ядра процессора?
+
+'плохая идея лишний раз гонять трафик по сокетам'
+
+master и 4 worker'a
+каждый воркер связывается с мастером через socketpair
+
+master распределяет зарпросы через сокеты по воркерам
+мастер читает запрос slave-сокета, пишет запрос в socketpair какому-нибудь
+воркеру, тот его читает, исполняет, отвечает,
+мастер читает, пишет в slave ответ и slave отправляет данные в сеть
+
+сложна...
+'плохая идея лишний раз гонять трафик по сокетам'
+
+что если дескриптор slave'а мы могли бы передать воркерам, чтобы воркер
+сам читал данные и отправлял обратно?
+
+ - fd_passing
+можно передать не только дескриптор сокета, но и файловый, да и вообще любой
+
+теперь каждый воркер работает на своем ядре
+можно даже привязать воркеров к ядрам жестко, но в этом, как правило, нет
+необходимости - сколько воркеров, столько ядер -  планировщик сам разберется
+
+
+size_t sock_fd_write(int sock, // сокет в который будем посылать
+					void* buf, // информация котторую будем посылать
+					ssize_t buflen, // размер информации
+					int fd)	{ 
+	ssize_t size;
+	struct msghdr msg; // правильно заполняя эту структуру мы передадим
+	// нашу порцию инфы со служебными  данными сд - наш дескриптор
+	struct iovec iov; // сюда пишется наш буфер
+	union { 
+		struct cmsghdr ;
+		char control[CMSG_SPACE(sizeof(int))];
+	} cmsgu; 
+	struct cmsghdr* cmsg;
+
+	iov.iov_base = buf; iov.iov_len = buflen;
+	// чтобы передать дескриптор, мы должны передать хотя бы 1 байт служебной ин	// фы = > buflen != 0
+	msg.msg_name = NULL; msg.msg_namelen = 0;
+	msg.msg_iov = &iov; msg.msg_iovlen = 1;
+
+	if (fd != 1)	{
+		msg.msg_control = cmsgu.control; // заполняется cmsgu
+		msg.msg_controllen = sizeof(cmsgu.control);
+		cmsg = CMSG_FIRSTHDR(&msg);
+		cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+		cmsg->cmsg_level = SOL_SOCKET;
+		cmsg->cmsg_type = SCM_RIGHTS;
+		printf("passing fd %d\n", fd);
+		*((int*)CMSG_DATA(cmsg)) = fd;
+	}	else	{
+		msg.msg_control = NULL;
+		msg.msg_controllen = 0;
+		printf("not passing fd\n");
+	}
+	size = sendmsg(sock, &msg, 0); /* sendto */
+	if (size < 0)
+		perror("sendmsg");
+	return size;
+}
+
+теперь инфу нужно принять
+ssize_t sock_fd_read (int sock, void* buf, ssize_t bufsize, int* fd)	{
+
+	ssize_t size;
+	if (fd)	{
+		struct msghdr msg;
+		struct iovec iov;
+		union {
+			struct cmsghdr;
+			char control[XCMSG_SPACE(sizeof(int))];
+		} cmsgu;
+		struct cmsghdr* cmsg;
+
+		// - те же переменные, те же объявления
+
+		iov.iov_base = buf; // то же самое
+		iov.iov_len = bufsize; // то же самое
+		msg.msg_name = NULL; msg.msg_namelen = 0; msg.msg_iov = &iov;
+		msg.msg_iovlen = 1;
+		msg.msg_control = cmsgu.control;
+		msg.msg_contollen = sizeof(cmsgu.contol);
+
+		// - то же самое
+
+
+		size = recvmsg(sock, &msg, 0);	// получили msg, теперь должны
+		распарсить
+
+		if (size cmsg_len ==
+		CMSG_LEN(sizeof(int)) // != 0, если = 0, то ничего не пришло
+		)	{
+			if (cmsg->cmsg_level != SOL_SOCKET)
+			{ // нам пришло то, что мы ожидали? 
+				fprintf(srderr, "invalid cmsg_level %d\n",
+					cmsg->cmsg_level); exit(1);
+			}
+			if (cmsg->cmsg_type != SCM_RIGTHS) { // аналогично
+				fprintf(stderr, "invalid cmsg_type %d\n",
+					cmsg->cmg_type); exit(1);
+			}
+			*fd = *((int*)CMSG_DATA(cmsg)); // достаем из DATA fd 
+			printf("received fd %d\n", *fd); // пишем, что он пришел
+		}	else *fd = 1;
+
+	}
+	else {
+
+		size = read(sock, buf, bufsize);
+		if (size < 0) { perror("read"); exit(1); }
+	}
+
+	return size;
+
+}
